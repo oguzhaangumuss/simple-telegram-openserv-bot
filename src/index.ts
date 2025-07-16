@@ -1,7 +1,6 @@
 import dotenv from 'dotenv'
 import TelegramBot from 'node-telegram-bot-api'
 import { Agent } from '@openserv-labs/sdk'
-import axios from 'axios'
 import { z } from 'zod'
 
 // Load environment variables
@@ -33,35 +32,10 @@ class SimpleTelegramBot extends Agent {
     this.workspaceId = parseInt(process.env.WORKSPACE_ID!)
     this.agentId = parseInt(process.env.AGENT_ID!)
 
-    // Add debug capability to discover available agents
-    this.addDebugCapability()
 
     this.setupHandlers()
   }
 
-  private addDebugCapability() {
-    // Add this temporary capability to see available agents
-    this.addCapability({
-      name: 'debugAgents',
-      description: 'Debug: log all available agents',
-      schema: z.object({}),
-      async run({ args, action }) {
-        if (!action?.workspace?.agents) {
-          console.log('❌ No workspace agents available')
-          return 'No workspace context available'
-        }
-        
-        console.log('🔍 Available Agents in Workspace:')
-        action.workspace.agents.forEach((agent, index) => {
-          console.log(`${index + 1}. Name: \"${agent.name}\" | ID: ${agent.id}`)
-          console.log(`   Capabilities: ${agent.capabilities_description}`)
-          console.log('---')
-        })
-        
-        return `Found ${action.workspace.agents.length} agents. Check console for details.`
-      }
-    })
-  }
 
   private setupHandlers() {
     // Handle /start command
@@ -90,34 +64,58 @@ Example: /ask What is OpenServ?'
 
       try {
         console.log(`📝 Question received: \"${question}\"`)
+        console.log(`💬 Using marketplace agent ${this.agentId} via chat message...`)
         
-        // Create task for the agent
-        const task = await this.createTask({
+        // Use sendChatMessage for marketplace agents
+        const chatResponse = await this.sendChatMessage({
           workspaceId: this.workspaceId,
-          assignee: this.agentId,
-          description: 'Answer user question',
-          body: `User asked: \"${question}\"\
-\
-Please provide a helpful and accurate answer.`,
-          input: question,
-          expectedOutput: 'A clear and helpful answer to the user question',
-          dependencies: []
+          agentId: this.agentId, 
+          message: question
         })
 
-        console.log(`🚀 Task created with ID: ${task.id}`)
-
-        // Wait for task completion
-        const result = await this.waitForTaskCompletion(task.id, chatId)
+        console.log(`✅ Chat response received:`, chatResponse)
         
-        if (result) {
-          await this.bot.sendMessage(chatId, result)
+        // Handle the response from marketplace agent
+        if (chatResponse && (chatResponse.message || chatResponse.content)) {
+          // Extract message from response (format may vary)
+          const responseText = chatResponse.message || chatResponse.content
+          await this.bot.sendMessage(chatId, `🤖 Agent Response:\n\n${responseText}`)
         } else {
-          await this.bot.sendMessage(chatId, '❌ Sorry, I could not answer your question. Please try again.')
+          // Chat message sent but no immediate response - this is normal for marketplace agents
+          console.log('📨 Chat message sent successfully, but no immediate response')
+          console.log('🔍 Full response object:', JSON.stringify(chatResponse, null, 2))
+          
+          // Wait for agent to respond and get the latest message
+          await this.bot.sendMessage(chatId, `✅ Question sent to agent. Getting response...`)
+          
+          // Simple delay and get response
+          await new Promise(resolve => setTimeout(resolve, 3000)) // Wait 3 seconds
+          
+          try {
+            const chatMessages = await this.getChatMessages({
+              workspaceId: this.workspaceId,
+              agentId: this.agentId
+            })
+            
+            if (chatMessages && chatMessages.messages && chatMessages.messages.length > 0) {
+              // Get the last agent message
+              const agentMessages = chatMessages.messages.filter(msg => msg.author === 'agent')
+              if (agentMessages.length > 0) {
+                const latestResponse = agentMessages[agentMessages.length - 1]
+                await this.bot.sendMessage(chatId, `🤖 Agent Response:\n\n${latestResponse.message}`)
+              } else {
+                await this.bot.sendMessage(chatId, `⏰ No response yet. Please try again.`)
+              }
+            }
+          } catch (chatError) {
+            console.error('❌ Error getting chat messages:', chatError)
+            await this.bot.sendMessage(chatId, `❌ Error getting response. Please try again.`)
+          }
         }
 
       } catch (error) {
         console.error('Error processing question:', error)
-        await this.bot.sendMessage(chatId, '❌ An error occurred. Please try again.')
+        await this.bot.sendMessage(chatId, `❌ Error communicating with agent: ${error instanceof Error ? error.message : 'Unknown error'}`)
       }
     })
 
@@ -146,76 +144,6 @@ Example:
     console.log('✅ Telegram bot handlers set up successfully!')
   }
 
-  private async waitForTaskCompletion(taskId: number, chatId: number): Promise<string | null> {
-    const maxWaitTime = 120000 // 2 minutes
-    const pollInterval = 5000   // 5 seconds
-    const startTime = Date.now()
-
-    while (Date.now() - startTime < maxWaitTime) {
-      try {
-        // Continue typing indicator
-        this.bot.sendChatAction(chatId, 'typing')
-
-        // Check task status
-        const taskDetail = await this.getTaskDetail({
-          taskId: taskId,
-          workspaceId: this.workspaceId
-        })
-
-        console.log(`⏳ Task ${taskId} status: ${taskDetail?.status}`)
-
-        if (taskDetail?.status === 'done') {
-          console.log(`✅ Task completed!`)
-
-          // Check for output file
-          if (taskDetail.attachments && taskDetail.attachments.length > 0) {
-            try {
-              const files = await this.getFiles({ workspaceId: this.workspaceId })
-              const resultFile = files.find((file: any) => 
-                taskDetail.attachments?.some((att: any) => file.path?.includes(att.path))
-              )
-
-              if (resultFile) {
-                const fileContent = await axios.get(resultFile.fullUrl)
-                
-                // Clean up the file
-                await this.deleteFile({
-                  workspaceId: this.workspaceId,
-                  fileId: resultFile.id
-                }).catch(() => {})
-
-                return fileContent.data || 'Task completed but could not retrieve result.'
-              }
-            } catch (fileError) {
-              console.error('Error reading result file:', fileError)
-            }
-          }
-
-          // If no file attachment, check task output
-          if (taskDetail.output) {
-            return taskDetail.output
-          }
-
-          return 'Task completed.'
-        }
-
-        if (taskDetail?.status === 'error') {
-          console.error(`❌ Task failed`)
-          return null
-        }
-
-        // Wait before next poll
-        await new Promise(resolve => setTimeout(resolve, pollInterval))
-
-      } catch (pollError) {
-        console.error('Error during polling:', pollError)
-        // Continue polling despite errors
-      }
-    }
-
-    console.log(`⏰ Task ${taskId} timeout`)
-    return 'Timeout. The task might still be processing.'
-  }
 
   public async start(): Promise<void> {
     try {
